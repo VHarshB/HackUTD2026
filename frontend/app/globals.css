@@ -1030,6 +1030,38 @@ details[open] summary svg {
   margin-top: 7px;
   font-variant-numeric: tabular-nums;
 }
+.timeline-transport {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.transport-button {
+  display: grid;
+  place-items: center;
+  width: 33px;
+  height: 33px;
+  border-radius: 4px;
+  color: #cdeaf0;
+  border: 1px solid #6d94ac30;
+  background: #6d94ac09;
+}
+.transport-button.active {
+  color: #0b171d;
+  background: #8ad4de;
+  border-color: #8ad4de;
+}
+.speed-select {
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.4px;
+  color: #b0cbd9;
+  border: 1px solid #6d94ac30;
+  background: #6d94ac09;
+  border-radius: 4px;
+  padding: 9px 6px;
+  min-height: 33px;
+  cursor: pointer;
+}
 .timeline-slider {
   flex: 1;
   min-width: 0;
@@ -1792,6 +1824,14 @@ details[open] summary svg {
     padding: 7px 9px;
     font-size: 9px;
     order: 2;
+  }
+  .transport-button {
+    width: 29px;
+    height: 29px;
+  }
+  .speed-select {
+    min-height: 29px;
+    font-size: 8px;
   }
   .timeline-slider {
     flex-basis: 100%;

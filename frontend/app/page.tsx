@@ -61,6 +61,12 @@ export default function ControlRoom() {
   const [railOpen, setRailOpen] = useState(false),
     [helpOpen, setHelpOpen] = useState(false);
   const initializedDataset = useRef("");
+  // Playback issues one request per frame. Those are not user-visible loads, so
+  // they must not strobe the spinner or disable the scene while it animates.
+  const playing = useRef(false);
+  const replayPlaying = useCallback((value: boolean) => {
+    playing.current = value;
+  }, []);
   const graph = useMemo(() => (data ? buildScene(data) : null), [data]);
   const selectedAsset =
     selection && graph ? graph.assets[selection.assetId] : undefined;
@@ -96,7 +102,7 @@ export default function ControlRoom() {
   useEffect(() => {
     if (!dataset) return;
     const controller = new AbortController();
-    setBusy(true);
+    if (!playing.current) setBusy(true);
     setError("");
     api
       .dashboard(dataset, at, controller.signal)
@@ -473,6 +479,7 @@ export default function ControlRoom() {
             key={dataset}
             data={data}
             onChange={replay}
+            onPlayingChange={replayPlaying}
             busy={busy}
           />
           {busy && (

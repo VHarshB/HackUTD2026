@@ -70,7 +70,9 @@ class Analysis:
         alerts.sort(key=_alert_order)
 
         return {
-            'now': now, 'start': data.start, 'end': data.end,
+            # `step` is the inferred sampling interval, so the UI can walk the
+            # recording a reading at a time without assuming five minutes.
+            'now': now, 'start': data.start, 'end': data.end, 'step': data.step,
             'systems': data.network['systems'],
             'facilities': facilities,
             'alerts': alerts,

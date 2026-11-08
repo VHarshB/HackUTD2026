@@ -69,6 +69,8 @@ export type Dashboard = {
   now: number;
   start: number;
   end: number;
+  /** Seconds between recorded readings, inferred by the backend. */
+  step: number;
   systems: System[];
   facilities: Facility[];
   alerts: Incident[];
