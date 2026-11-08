@@ -22,9 +22,13 @@ body {
   overflow: hidden;
 }
 body {
+  /* The EOG dataset README requires Comic Sans throughout for an AI-built app.
+     Restored after the digital-twin rewrite replaced it with Inter. */
   font-family:
+    "Comic Sans MS",
+    "Comic Sans",
+    "Chalkboard SE",
     Inter,
-    Geist,
     -apple-system,
     BlinkMacSystemFont,
     "Segoe UI",
