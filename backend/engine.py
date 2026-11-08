@@ -1,186 +1,289 @@
-"""Telemetry-only detection and deterministic, event-based planning."""
-import csv
-import json
-import itertools
-from pathlib import Path
-from statistics import median
+"""Turning a dataset and a timestamp into the console an operator reads.
 
-ROOT = Path(__file__).resolve().parents[1] / 'data' / 'eog'
+This is the layer that answers "what is happening right now, and what should I
+do about it". It owns none of the hard maths: detection lives in detect.py and
+the cost optimisation in planner.py. What it does own is the operator's view --
+which events are still in progress, how long each tank has, which plans the
+system's shared trucks can actually support, and the order to show them in.
 
+Replay is free. The detectors are causal, so every event is found once per
+dataset and then filtered by the requested timestamp: scrubbing the timeline
+shows exactly what the console would have shown at that moment, with no
+knowledge of what happened afterwards.
+"""
+from __future__ import annotations
 
-class Dataset:
-    def __init__(self, name):
-        folder = (ROOT / name).resolve()
-        if not folder.is_relative_to(ROOT.resolve()):
-            raise ValueError('Dataset must be inside data/eog')
-        self.network = json.loads((folder / 'network.json').read_text())
-        self.ops = json.loads((folder / 'ops.json').read_text())
-        self.series = {}
-        with (folder / 'telemetry.csv').open(newline='') as file:
-            for r in csv.DictReader(file):
-                self.series.setdefault((r['asset_id'], r['metric']), []).append((int(r['ts_unix']), float(r['value'])))
-        if not self.series:
-            raise ValueError('Empty telemetry')
-        for series in self.series.values():
-            series.sort()
-        self.start = min(v[0][0] for v in self.series.values())
-        self.end = max(v[-1][0] for v in self.series.values())
+from functools import lru_cache
 
-    def values(self, asset, metric, now):
-        import bisect
-        series = self.series.get((asset, metric), [])
-        return series[:bisect.bisect_right(series, (now, float('inf')))]
+from .dataset import Dataset, Series, ROOT
+from .detect import Baselines, Event, detect_all
+from .planner import (FacilityProblem, allocate, candidates, hours_to_limit,
+                      reuse_possible, simulate)
 
-    def value(self, asset, metric, now, default=0):
-        values = self.values(asset, metric, now)
-        return values[-1][1] if values else default
+# How many recent inflow readings feed the countdown's uncertainty band.
+INFLOW_WINDOW = 12
 
-    def analyze(self, now=None):
-        now = self.end if now is None else max(self.start, min(now, self.end))
-        facilities, alerts = [], []
-        for system in self.network['systems']:
-            for f in system['facilities']:
-                pid, lid = f['pump']['id'], f['pipeline']['id']
-                level = self.value(f['tank']['id'], 'level_pct', now)
-                flow = self.value(pid, 'flow_bpd', now)
-                received = self.value(lid, 'receive_flow_bpd', now)
-                status = self.value(pid, 'status', now)
-                category, evidence, onset = None, [], now
-                if status == 2:
-                    category = 'pump_failure'
-                    for ts, val in reversed(self.values(pid, 'status', now)):
-                        if val != 2:
-                            break
-                        onset = ts
-                    evidence = ['Pump reports fault status 2.', f'Pump discharge flow is {flow:.0f} bbl/day.']
-                else:
-                    recent = self.values(pid, 'flow_bpd', now)[-288:]
-                    running = [(ts, v) for ts, v in recent if self.value(pid, 'status', ts) == 1 and v > 0][-12:]
-                    # Retain evidence across normal pump-off cycles; use medians to suppress sensor noise.
-                    if len(running) >= 8:
-                        receipt_ratio = median(self.value(lid, 'receive_flow_bpd', ts)/v for ts,v in running)
-                        rated_ratio = median(v/f['pump']['max_flow_bpd'] for _,v in running)
-                        if receipt_ratio < .98:
-                            category, onset = 'pipeline_leak', running[0][0]
-                            evidence = [f'Median pipeline receipt is {receipt_ratio*100:.1f}% of pump flow across {len(running)} running samples.', 'Evidence retained through normal pump-off cycles.']
-                        elif rated_ratio < .985:
-                            category, onset = 'pump_degradation', running[0][0]
-                            evidence = [f'Median running flow is {rated_ratio*100:.1f}% of rated capacity across {len(running)} samples.', 'Evidence retained through normal pump-off cycles.']
-                item = dict(f, system_id=system['id'], level_pct=level, pump_status=status, flow_bpd=flow, category=category)
-                facilities.append(item)
-                if category:
-                    water = [max(0, self.value(w['id'], 'water_bpd', now)) for w in f['wells']]
-                    rates = [(w['oil_bpd'] * self.ops['prices']['oil_per_bbl'] + w['gas_mcfd'] * self.ops['prices']['gas_per_mcf']) / 24 for w in f['wells']]
-                    limit = self.network['defaults']['tank_limits_pct']['shutdown']
-                    hours = max(0, (limit-level)/100*f['tank']['capacity_bbl']/(sum(water)/24)) if sum(water) else 0
-                    alert = dict(facility_id=f['id'], system_id=system['id'], category=category, onset_unix=onset, evidence=evidence, confidence=.99 if category == 'pump_failure' else .85, hours_to_limit=hours if category == 'pump_failure' else None, revenue_per_hour=sum(rates))
-                    if category == 'pump_failure':
-                        horizon = max(0, self.ops['expected_repair_hours']['pump_failure']-(now-onset)/3600)
-                        alert['candidates'] = candidates(f, self.ops, system['id'], level, limit, horizon, water, rates)
-                    else:
-                        alert['recommendation'] = {'label': 'Urgent field inspection' if category == 'pipeline_leak' else 'Request pump inspection', 'cost': 0, 'actions': [{'type':'field_inspection', 'asset_id':lid if category == 'pipeline_leak' else pid}]}
-                    alerts.append(alert)
-        for sid, group in itertools.groupby(sorted([a for a in alerts if a['category']=='pump_failure'], key=lambda a:a['system_id']), key=lambda a:a['system_id']):
-            group = list(group)
-            # Reserve each truck for its entire job; overlapping jobs cannot double-book it.
-            # Conservative: trucks are not reassigned to another facility within this horizon.
-            fleet = self.ops['systems'][sid]['emergency_fleet_size']
-            states = {0: (0, [])}
-            for a in group:
-                next_states = {}
-                for used, (cost, plans) in states.items():
-                    for plan in a['candidates']:
-                        n = used + plan['trucks']
-                        if n <= fleet and (n not in next_states or cost+plan['cost'] < next_states[n][0]):
-                            next_states[n] = (cost+plan['cost'], plans+[plan])
-                states = next_states
-            selected = min(states.values(), key=lambda v:v[0])[1]
-            for a, plan in zip(group, selected):
-                a['recommendation'] = plan
-        alerts.sort(key=lambda a:(a['category']!='pump_failure', a['hours_to_limit'] if a['hours_to_limit'] is not None else 1e9, -a['revenue_per_hour']))
-        return dict(now=now, start=self.start, end=self.end, systems=self.network['systems'], facilities=facilities, alerts=alerts, limits=self.network['defaults']['tank_limits_pct'], planning_scope='Best verified candidate; simultaneous truck jobs, common timed well shut-in. Cross-facility truck reuse and independently timed well shut-ins are not searched.')
+__all__ = ['Dataset', 'Series', 'ROOT', 'Analysis', 'simulate', 'analyze']
 
 
-def simulate(capacity, limit, initial, horizon, water, revenue, shut, shut_at, arrivals, load, trip_cost):
-    """Integrate exactly between arrivals, shut-in, repair and safety trip."""
-    volume, cost, tripped = initial, len(arrivals)*trip_cost, initial >= limit-1e-7
-    trace = [{'hour':0, 'level_pct':100*volume/capacity}]
-    previous = 0
-    for t in sorted(set([0, horizon, shut_at] + arrivals)):
-        if t < 0 or t > horizon:
-            continue
-        active = [i for i in range(len(water)) if not (i in shut and previous >= shut_at)]
-        inflow = sum(water[i] for i in active)/24 if not tripped else 0
-        dt = t-previous
-        if tripped:
-            cost += sum(revenue)*dt
-        else:
-            cost += sum(revenue[i] for i in shut)*dt if previous >= shut_at else 0
-            until = (limit-volume)/inflow if inflow else float('inf')
-            if until < dt-1e-8 or (until <= dt+1e-9 and t < horizon-1e-8):
-                cost += sum(revenue[i] for i in active)*max(0,dt-until)
-                volume, tripped = limit, True
-            else:
-                volume += inflow*dt
-        trace.append({'hour':round(t,6), 'level_pct':100*volume/capacity})
-        if t in arrivals:
-            amount = arrivals.count(t)*load
-            if amount > volume+1e-6:
-                return None
-            volume -= amount
-            trace.append({'hour':round(t,6), 'level_pct':100*volume/capacity})
-        previous = t
-    return dict(cost=round(cost,2), tripped=tripped, trace=trace, verified=True)
+class Analysis:
+    """A dataset plus everything that can be computed once and reused.
+
+    Detection sweeps the whole recording a single time; each request for a
+    replay timestamp is then a cheap filter and a plan search over whatever is
+    still in progress.
+    """
+
+    def __init__(self, name: str):
+        self.data = Dataset(name)
+        self.baselines = Baselines(self.data)
+        self.events: list[Event] = detect_all(self.data)
+        self.truck_reuse_possible = reuse_possible(self.data)
+        self._cache: dict[int, dict] = {}
+
+    # -- per-timestamp view ------------------------------------------------
+
+    def at(self, now: int) -> dict:
+        """The full console payload for one moment in the recording.
+
+        Cached per timestamp, so dragging the replay slider back over ground it
+        has already covered costs nothing.
+        """
+        now = self.data.clamp(now)
+        if now in self._cache:
+            return self._cache[now]
+        view = self._build(now)
+        self._cache[now] = view
+        return view
+
+    def _build(self, now: int) -> dict:
+        data = self.data
+
+        live = [e for e in self.events if e.visible_at(now)]
+        ongoing = [e for e in live if e.status_at(now) == 'ongoing']
+
+        facilities = [self._facility_snapshot(f_id, now, ongoing)
+                      for f_id in data.facilities]
+
+        alerts = [self._alert(event, now) for event in ongoing]
+        self._share_trucks(alerts, now)
+        alerts.sort(key=_alert_order)
+
+        return {
+            'now': now, 'start': data.start, 'end': data.end,
+            'systems': data.network['systems'],
+            'facilities': facilities,
+            'alerts': alerts,
+            'events': [self._event_record(e, now) for e in live],
+            'limits': data.limits,
+            'baselines': self.baselines.describe(),
+            'planning_scope': self._scope(),
+        }
+
+    # -- pieces ------------------------------------------------------------
+
+    def _facility_snapshot(self, facility_id: str, now: int, ongoing: list[Event]) -> dict:
+        """Current sensor picture for one facility, for the map and detail pane."""
+        data = self.data
+        facility = data.facilities[facility_id]
+        problem = next((e for e in ongoing if e.facility_id == facility_id), None)
+        return {
+            **facility,
+            'system_id': data.system_of[facility_id]['id'],
+            'level_pct': data.value(facility['tank']['id'], 'level_pct', now),
+            'pump_status': data.value(facility['pump']['id'], 'status', now),
+            'flow_bpd': data.value(facility['pump']['id'], 'flow_bpd', now),
+            'inflow_bpd': data.value(facility_id, 'inflow_bpd', now),
+            'pipeline_psi': data.value(facility['pipeline']['id'], 'pressure_psi', now),
+            'category': problem.category if problem else None,
+        }
+
+    def well_rates(self, facility: dict, now: int) -> tuple[list[float], list[float]]:
+        """Each well's water rate and lost revenue per hour, as of `now`.
+
+        A well that is currently shut in reads zero water, which would make the
+        tank look like it had stopped filling. For planning we want the rate the
+        well will produce once it is allowed to, so a shut-in well falls back to
+        its baseline from network.json.
+        """
+        data = self.data
+        water, revenue = [], []
+        for well in facility['wells']:
+            producing = data.value(well['id'], 'status', now, 1) == 1
+            measured = data.value(well['id'], 'water_bpd', now)
+            water.append(max(0.0, measured) if producing and measured > 0
+                         else well['baseline_water_bpd'])
+            revenue.append(data.well_revenue_per_hour(well))
+        return water, revenue
+
+    def _alert(self, event: Event, now: int) -> dict:
+        """One row of the alerts view: what is wrong, how long we have, what to do."""
+        data = self.data
+        facility = data.facilities[event.facility_id]
+        level = data.value(facility['tank']['id'], 'level_pct', now)
+        water, revenue = self.well_rates(facility, now)
+
+        alert = {
+            'event_id': _event_id(event),
+            'facility_id': event.facility_id,
+            'system_id': event.system_id,
+            'asset_id': event.asset_id,
+            'category': event.category,
+            'status': 'ongoing',
+            'onset_unix': event.onset_unix,
+            'alarm_unix': event.alarm_unix,
+            'end_unix': None,
+            'confidence': round(event.confidence, 3),
+            'evidence': list(event.evidence),
+            'peak_sigma': round(event.peak_sigma, 2),
+            'level_pct': round(level, 2),
+            'revenue_per_hour': round(sum(revenue), 2),
+            'hours_to_limit': None,
+            'hours_to_limit_band': None,
+        }
+
+        if event.category != 'pump_failure':
+            # A leak or a worn pump still pumps, so the tank is not filling and
+            # there is no countdown. The action is to get eyes on the asset.
+            urgent = event.category == 'pipeline_leak'
+            alert['recommendation'] = {
+                'label': 'Send an inspector now' if urgent else 'Schedule a pump inspection',
+                'cost': 0.0, 'baseline_cost': 0.0, 'verified': True, 'tripped': False,
+                'trucks': 0, 'trace': [],
+                'actions': [{'type': 'field_inspection', 'asset_id': event.asset_id}],
+                'alternatives': [],
+            }
+            return alert
+
+        # --- pump failure: countdown and costed plan ------------------------
+        inflow = [v for _ts, v in data.channel(event.facility_id, 'inflow_bpd')
+                  .tail(now, INFLOW_WINDOW)]
+        if not inflow:
+            inflow = [sum(water)]
+        band = hours_to_limit(level, facility['tank']['capacity_bbl'],
+                              data.limits['shutdown'], inflow)
+        alert['hours_to_limit'] = round(band['p50'], 3)
+        alert['hours_to_limit_band'] = {k: round(band[k], 3) for k in ('p10', 'p50', 'p90')}
+        alert['inflow_bpd'] = round(band['inflow_bpd'], 1)
+
+        # Repairs run a fixed length from onset, so what is left is what we plan against.
+        elapsed_h = (now - event.onset_unix) / 3600.0
+        horizon = max(0.0, data.ops['expected_repair_hours']['pump_failure'] - elapsed_h)
+        alert['repair_hours_remaining'] = round(horizon, 3)
+        alert['_problem'] = FacilityProblem(data, facility, level, horizon, water, revenue)
+        return alert
+
+    def _share_trucks(self, alerts: list[dict], now: int) -> None:
+        """Pick the plans, one system at a time, because each system's fleet is shared.
+
+        Nothing has been dispatched yet in this recording, so at any replay moment
+        every truck in a system is idle and available to every one of that
+        system's filling tanks -- but only to one of them at a time.
+        """
+        failures = [a for a in alerts if a['category'] == 'pump_failure']
+        by_system: dict[str, list[dict]] = {}
+        for alert in failures:
+            by_system.setdefault(alert['system_id'], []).append(alert)
+
+        for system_id, group in by_system.items():
+            problems = [a.pop('_problem') for a in group]
+            options = {p.facility_id: candidates(p) for p in problems}
+            fleet = self.data.ops['systems'][system_id]['emergency_fleet_size']
+            chosen = allocate(problems, options, fleet)
+
+            for alert, problem, plan in zip(group, problems, chosen):
+                ranked = options[problem.facility_id]
+                alert['recommendation'] = {
+                    'label': plan['label'], 'cost': plan['cost'],
+                    'baseline_cost': plan['baseline_cost'],
+                    'verified': plan.get('verified', False), 'tripped': plan['tripped'],
+                    'trucks': plan['trucks'], 'trips_per_truck': plan.get('trips', 0),
+                    'dispatch_delay_min': round(plan.get('delay_h', 0.0) * 60, 1),
+                    'trace': plan['trace'], 'actions': plan['actions'],
+                    # What the operator gave up by taking this plan, for the UI.
+                    'alternatives': [{'label': p['label'], 'cost': p['cost'],
+                                      'tripped': p['tripped'], 'trucks': p['trucks']}
+                                     for p in ranked[:6]],
+                    'fleet_size': fleet,
+                    'shared_with': [o['facility_id'] for o in group
+                                    if o is not alert],
+                }
+
+    def _event_record(self, event: Event, now: int) -> dict:
+        """One event in the export shape from SPEC.md, resolved ones included."""
+        data = self.data
+        status = event.status_at(now)
+        record = {
+            'event_id': _event_id(event),
+            'system_id': event.system_id,
+            'facility_id': event.facility_id,
+            'asset_id': event.asset_id,
+            'category': event.category,
+            'status': status,
+            'onset_ts': _iso(event.onset_unix),
+            'onset_unix': event.onset_unix,
+            'end_ts': _iso(event.end_unix) if status == 'resolved' else None,
+            'end_unix': event.end_unix if status == 'resolved' else None,
+            'confidence': round(event.confidence, 3),
+            'evidence': list(event.evidence),
+            'hours_to_limit': None,
+            'recommended_actions': [],
+        }
+        if status == 'ongoing':
+            record['level_pct'] = round(
+                data.value(data.facilities[event.facility_id]['tank']['id'], 'level_pct', now), 2)
+        return record
+
+    def _scope(self) -> str:
+        """An honest statement of what the optimiser did and did not search."""
+        reuse = ('A truck could in principle finish one job and reach a second tank '
+                 'inside a repair window on this network, so dispatches are scheduled '
+                 'on a shared truck timeline.'
+                 if self.truck_reuse_possible else
+                 'On this network no truck can finish one job and reach a second tank '
+                 'before the repair ends, so each dispatch holds its trucks for the '
+                 'whole response.')
+        return ('Plans are chosen by replaying every combination of truck dispatches and '
+                'well shut-ins against the tank and keeping the cheapest that never '
+                'reaches the shutdown limit. Shut-ins start as late as the tank allows. '
+                'Concurrent failures in one system are solved together against that '
+                "system's fleet. " + reuse)
 
 
-def candidates(f, ops, sid, level, limit_pct, horizon, water, revenue):
-    cap = f['tank']['capacity_bbl']; initial = cap*level/100; limit = cap*limit_pct/100
-    travel = ops['systems'][sid]['facilities'][f['id']]
-    fleet = ops['systems'][sid]['emergency_fleet_size']
-    load = ops['emergency_trucking']['truck_capacity_bbl']; price = ops['emergency_trucking']['cost_per_trip']
-    def run(shut, at, arrivals):
-        return simulate(cap, limit, initial, horizon, water, revenue, shut, at, arrivals, load, price)
-    base = run([], horizon, [])
-    plans = [dict(base, label='Accept automatic shutdown' if base['tripped'] else 'Monitor until repair', trucks=0, actions=[], baseline_cost=base['cost'])]
-    if initial >= limit-1e-7 or horizon <= 0:
-        return plans
-    for trucks in range(fleet+1):
-        max_trips = max(0, int((horizon*60-travel['response_min']-1e-6)//travel['cycle_min'])+1) if trucks else 0
-        for trips in range(1 if trucks else 0, max_trips+1):
-            arrivals = [(travel['response_min']+j*travel['cycle_min'])/60 for j in range(trips) for _ in range(trucks)]
-            for mask in range(1 << len(water)):
-                shut = [i for i in range(len(water)) if mask & (1 << i)]
-                at = horizon
-                result = run(shut, at, arrivals)
-                if result is None or result['tripped']:
-                    if not shut:
-                        continue
-                    result = run(shut, 0, arrivals)
-                    if result is None or result['tripped']:
-                        continue
-                    lo, hi = 0, horizon
-                    for _ in range(32):
-                        mid = (lo+hi)/2
-                        trial = run(shut, mid, arrivals)
-                        if trial is not None and not trial['tripped']:
-                            lo = mid
-                        else:
-                            hi = mid
-                    at = max(0, lo-1e-6)
-                    result = run(shut, at, arrivals)
-                actions = []
-                if trucks:
-                    actions.append(dict(type='dispatch_truck', facility_id=f['id'], trucks=trucks, trips_per_truck=trips, arrival_hours=sorted(set(arrivals)), busy_until_hour=arrivals[-1]+travel['cycle_min']/60))
-                if shut and at < horizon-1e-5:
-                    actions.append(dict(type='shut_in_wells', wells=[f['wells'][i]['id'] for i in shut], start_after_min=round(at*60,2)))
-                label = ' + '.join(([f'{trucks} truck(s), {trips} trip(s) each'] if trucks else []) + ([f'Shut {len(shut)} well(s) at +{at*60:.0f} min'] if shut and at < horizon-1e-5 else [])) or 'Monitor until repair'
-                plans.append(dict(result, label=label, trucks=trucks, actions=actions, baseline_cost=base['cost']))
-    # One cheapest candidate for each fleet allocation is sufficient for joint selection.
-    best = {}
-    for p in plans:
-        if p['trucks'] not in best or p['cost'] < best[p['trucks']]['cost']:
-            best[p['trucks']] = p
-    alternatives = sorted(plans, key=lambda p:p['cost'])
-    for p in best.values():
-        p['alternatives'] = [dict(label=x['label'], cost=x['cost'], tripped=x['tripped']) for x in [plans[0]]+alternatives[:5]]
-    return list(best.values())
+def _alert_order(alert: dict) -> tuple:
+    """The alerts view order from SPEC.md.
+
+    Pump failures first, soonest to reach the shutdown limit at the top, ties
+    broken by the facility with more revenue on the line. Leaks and worn pumps
+    follow in any order -- they have no countdown.
+    """
+    is_failure = alert['category'] == 'pump_failure'
+    return (
+        0 if is_failure else 1,
+        alert['hours_to_limit'] if alert['hours_to_limit'] is not None else float('inf'),
+        -alert['revenue_per_hour'],
+    )
+
+
+def _event_id(event: Event) -> str:
+    """A stable id so the same event keeps its identity across replay positions."""
+    return f'{event.facility_id}-{event.category}-{event.onset_unix}'
+
+
+def _iso(unix: int | None) -> str | None:
+    from datetime import datetime, timezone
+    if unix is None:
+        return None
+    return datetime.fromtimestamp(unix, timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+@lru_cache(maxsize=8)
+def load(name: str) -> Analysis:
+    """Load and fully analyse a dataset folder, cached between requests."""
+    return Analysis(name)
+
+
+def analyze(name: str, now: int | None = None) -> dict:
+    """Console payload for a dataset at a replay timestamp (default: its latest reading)."""
+    analysis = load(name)
+    return analysis.at(analysis.data.clamp(now))
