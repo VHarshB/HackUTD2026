@@ -1,38 +1,497 @@
-'use client';
-import { useEffect, useState } from 'react';
-import { Activity, ArrowDownToLine, ArrowUpRight, CheckCheck, ChevronRight, Clock3, Fuel, Layers3, Radio, ShieldCheck, Sparkles, Truck, Waves, Zap } from 'lucide-react';
+"use client";
+import dynamic from "next/dynamic";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  AlertTriangle,
+  ArrowUpRight,
+  Box,
+  Crosshair,
+  HelpCircle,
+  Layers3,
+  LoaderCircle,
+  MousePointer2,
+  RotateCcw,
+  X,
+} from "lucide-react";
+import type {
+  Asset,
+  CameraIntent,
+  Dashboard,
+  Incident,
+  Navigation,
+  Selection,
+} from "../lib/types";
+import { api } from "../lib/api";
+import { buildScene, navigationFrame } from "../lib/scene-layout";
+import { humanize } from "../lib/operational-status";
+import TopBar from "../components/control-room/TopBar";
+import IncidentRail from "../components/control-room/IncidentRail";
+import AssetInspector from "../components/control-room/AssetInspector";
+import ReplayTimeline from "../components/control-room/ReplayTimeline";
 
-type Action = {type:string; trucks?:number; trips_per_truck?:number; wells?:string[]; start_after_min?:number};
-type Plan = {label:string;cost:number;baseline_cost?:number;verified?:boolean;tripped?:boolean;trace?:{hour:number;level_pct:number}[];actions:Action[];alternatives?:{label:string;cost:number;tripped:boolean}[]};
-type Alert = {facility_id:string;system_id:string;category:string;onset_unix:number;hours_to_limit:number|null;confidence:number;evidence:string[];recommendation:Plan};
-type Facility = {id:string;system_id:string;lat:number;lon:number;level_pct:number;pump_status:number;flow_bpd:number;category:string|null;tank:{id:string;capacity_bbl:number};pump:{id:string};wells:{id:string;oil_bpd:number;gas_mcfd:number}[]};
-type Data = {now:number;start:number;end:number;facilities:Facility[];alerts:Alert[];limits:{shutdown:number;warning:number};planning_scope:string;systems:{id:string;disposal_site:{id:string;lat:number;lon:number}}[]};
-const money=(n:number)=>new Intl.NumberFormat('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0}).format(n);
-const pretty=(s:string)=>s.replaceAll('_',' ').toLowerCase();
-const date=(n:number)=>new Date(n*1000).toLocaleString('en-US',{timeZone:'UTC',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false})+' UTC';
-async function get<T,>(url:string):Promise<T>{const r=await fetch(url);if(!r.ok){let m;try{m=(await r.json()).detail}catch{m=r.statusText}throw Error(m||'Request failed')}return r.json()}
+const DigitalTwinScene = dynamic(
+  () => import("../components/digital-twin/DigitalTwinScene"),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="scene-loading">
+        <LoaderCircle className="spin" size={24} />
+        <span>INITIALIZING 3D ENGINE</span>
+      </div>
+    ),
+  },
+);
+const DEFAULT_DATASET = "history/snapshot_2026-10-08T1200";
 
-export default function Dashboard(){
- const [datasets,setDatasets]=useState<string[]>([]),[dataset,setDataset]=useState('history/snapshot_2026-10-09T0330'),[at,setAt]=useState<number|null>(null),[data,setData]=useState<Data|null>(null),[selected,setSelected]=useState(''),[system,setSystem]=useState('all'),[error,setError]=useState(''),[busy,setBusy]=useState(false),[tab,setTab]=useState('Overview'),[ai,setAi]=useState(''),[thinking,setThinking]=useState(false),[reviewed,setReviewed]=useState(false),[trend,setTrend]=useState<{ts:number;value:number}[]>([]);
- useEffect(()=>{get<string[]>('/api/datasets').then(setDatasets).catch(e=>setError(e.message))},[]);
- useEffect(()=>{let live=true;setBusy(true);setAi('');setReviewed(false);get<Data>(`/api/dashboard?dataset=${encodeURIComponent(dataset)}${at!==null?'&at='+at:''}`).then(d=>{if(!live)return;setData(d);setError('');setSelected(s=>d.facilities.some(f=>f.id===s)?s:d.alerts[0]?.facility_id||d.facilities[0]?.id||'')}).catch(e=>live&&setError(e.message)).finally(()=>live&&setBusy(false));return()=>{live=false}},[dataset,at]);
- const facility=data?.facilities.find(f=>f.id===selected),alert=data?.alerts.find(a=>a.facility_id===selected),plan=alert?.recommendation;
- useEffect(()=>{setAi('');setReviewed(false);setTrend([]);let live=true;if(facility&&data)get<{ts:number;value:number}[]>(`/api/trend?dataset=${encodeURIComponent(dataset)}&asset=${facility.tank.id}&metric=level_pct&at=${data.now}`).then(v=>live&&setTrend(v)).catch(()=>{});return()=>{live=false}},[selected,data,dataset,facility]);
- async function investigate(){setThinking(true);setAi('');try{const r=await fetch('/api/investigate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset,facility_id:selected,at:data?.now})});const v=await r.json();if(!r.ok)throw Error(v.detail);setAi(v.answer+'\n\nTools executed: '+v.tools_executed.join(', '))}catch(e){setAi((e as Error).message)}finally{setThinking(false)}}
- const visible=data?.facilities.filter(f=>system==='all'||f.system_id===system)||[];
- const failures=data?.alerts.filter(a=>a.category==='pump_failure')||[];
- const savings=failures.reduce((s,a)=>s+Math.max(0,(a.recommendation.baseline_cost||0)-a.recommendation.cost),0);
- return <div className="shell"><aside className="sidebar"><a className="brand" href="/"><span className="brand-icon"><Waves size={23}/></span><span>NIGHTSHIFT<span className="ai-word"> AI</span><small>OPERATIONS INTELLIGENCE</small></span></a><div className="nav-label">WORKSPACE</div>{[['Overview',Layers3],['Incidents',Activity],['Fleet & response',Truck],['Shift handoff',ArrowUpRight]].map(([label,Icon])=>{const I=Icon as typeof Activity;return <button className={'nav-item '+(tab===label?'active':'')} key={String(label)} onClick={()=>setTab(String(label))}><I size={18}/>{String(label)}{label==='Incidents'&&<span className="count">{data?.alerts.length||0}</span>}</button>})}<div className="side-bottom"><div className="connection"><span className="dot"/> LOCAL DATA CONNECTED</div><p>Recorded telemetry replay<br/>Recommendations & simulations only</p><div className="operator"><div>NS</div><span>Night shift operator<small>Operations workspace</small></span></div></div></aside>
- <main><header><div className="breadcrumbs">Workspace <ChevronRight size={13}/> <span>{tab}</span></div><div className="header-right"><span className="live"><Radio size={13}/> REPLAY MODE</span><span className="utc">{data?date(data.now):'Connecting…'}</span></div></header><section className="content"><div className="page-heading"><div><div className="eyebrow">EVERY BARREL. EVERY MINUTE.</div><h1>{tab==='Overview'?'Your field, in focus.':tab}</h1><p>See what’s happening. Know what comes next.</p></div><a className="button secondary" href={`/api/events?dataset=${encodeURIComponent(dataset)}${data?'&at='+data.now:''}`} download="events.json"><ArrowDownToLine size={15}/> Export events</a></div>
- <div className="toolbar"><span><span className="dot"/> EOG TELEMETRY</span><select aria-label="Dataset" value={dataset} onChange={e=>{setDataset(e.target.value);setAt(null)}}>{datasets.map(d=><option key={d}>{d}</option>)}</select><span className="toolbar-note">5-minute sensor intervals</span>{busy&&<span>Analyzing…</span>}</div>{error&&<div role="alert" className="error">{error}</div>}
- <div className="stats"><Stat label="FACILITIES MONITORED" value={String(data?.facilities.length||0)} note={`${data?.systems.length||0} connected systems`} icon={<Fuel/>}/><Stat label="ACTIVE INCIDENTS" value={String(data?.alerts.length||0)} note={`${failures.length} pump failures need a response`} icon={<Activity/>} urgent/><Stat label="AVOIDABLE COST" value={money(savings)} note="Compared with no intervention" icon={<ArrowUpRight/>}/><Stat label="RESPONSE PLANS" value={String(failures.length)} note="Simulated · fleet constraints checked" icon={<ShieldCheck/>}/></div>
- {tab==='Shift handoff'?<section className="panel handoff"><div className="eyebrow">SHIFT BRIEF · {data&&date(data.now)}</div><h2>{data?.alerts.length||0} incidents across the field.</h2><p>{failures.length} pump failures are active. Current candidate plans avoid an estimated {money(savings)} in costs compared with no intervention.</p>{data?.alerts.map(a=><p key={a.facility_id}><b>{a.facility_id}</b> — {pretty(a.category)}. {a.recommendation.label}. Estimated response cost: {a.category==='pump_failure'?money(a.recommendation.cost):'Inspection cost not modeled'}.</p>)}<p className="muted">{data?.planning_scope}</p></section>:<>
- <div className="workspace-grid"><section className="panel network"><div className="panel-heading"><div><h2>{tab==='Fleet & response'?'Fleet coordination':'Network overview'}</h2><p>Connected facilities · Permian Basin</p></div><select aria-label="Filter system" value={system} onChange={e=>setSystem(e.target.value)}><option value="all">All systems</option>{data?.systems.map(s=><option key={s.id}>{s.id}</option>)}</select></div><div className="map"><div className="map-grid"/><span className="map-label">PERMIAN BASIN / WEST TEXAS</span><svg viewBox="0 0 700 320" role="img" aria-label="Facility network, select a facility to inspect"><defs><pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse"><path d="M 30 0 L 0 0 0 30" fill="none" stroke="#ffffff06"/></pattern></defs><rect width="700" height="320" fill="url(#grid)"/>{(()=>{const all=data?.facilities||[];if(!all.length)return null;const lats=all.map(f=>f.lat),lons=all.map(f=>f.lon);const x=(v:number)=>65+(v-Math.min(...lons))/(Math.max(...lons)-Math.min(...lons)||1)*560;const y=(v:number)=>260-(v-Math.min(...lats))/(Math.max(...lats)-Math.min(...lats)||1)*210;return visible.map(f=>{const s=data?.systems.find(s=>s.id===f.system_id);return <g key={f.id}><line x1={x(f.lon)} y1={y(f.lat)} x2={x(s?.disposal_site.lon||f.lon)} y2={y(s?.disposal_site.lat||f.lat)} stroke={f.category?'#b88344':'#2b4b49'} strokeWidth="1.5" strokeDasharray="4 4"/><g role="button" tabIndex={0} aria-label={f.id} onClick={()=>setSelected(f.id)} onKeyDown={e=>{if(e.key==='Enter'||e.key===' ')setSelected(f.id)}} style={{cursor:'pointer'}}><circle cx={x(f.lon)} cy={y(f.lat)} r={f.id===selected?15:10} fill={f.category?'#ffb15b16':'#6be0be12'} stroke={f.id===selected?'#fff':f.category?'#e9a45d':'#68bc9d'}/><circle cx={x(f.lon)} cy={y(f.lat)} r="3" fill={f.category?'#e9a45d':'#68bc9d'}/><text x={x(f.lon)+15} y={y(f.lat)+4} fill="#b7c6c4" fontSize="9">{f.id.replace('_FACILITY_',' · ')}</text></g></g>})})()}</svg><div className="map-legend"><span><i className="green"/> Normal</span><span><i className="amber"/> Attention required</span><span>○ Selected facility</span></div></div><div className="map-footer"><span><span className="dot"/> {visible.length} facilities visible</span><span>Click a facility to investigate <ArrowUpRight size={13}/></span></div></section>
- <section className="panel incident-panel"><div className="panel-heading"><div><h2>Needs attention <span className="badge">{data?.alerts.length||0}</span></h2><p>Prioritized by time to shutdown</p></div><Activity size={17}/></div><div className="incident-list">{data?.alerts.length===0&&<p className="empty">No active incidents detected at this timestamp.</p>}{data?.alerts.map(a=><button key={a.facility_id} className={'incident '+(selected===a.facility_id?'selected':'')} onClick={()=>setSelected(a.facility_id)}><div className="incident-top"><span className={'severity '+(a.category==='pump_failure'?'critical':'warning')}>{a.category==='pump_failure'?'CRITICAL':'INSPECTION'}</span><span>{a.system_id}</span></div><strong>{pretty(a.facility_id)}</strong><div className="incident-bottom"><span>{pretty(a.category)}</span><span>{a.hours_to_limit!==null?<><Clock3 size={12}/> {a.hours_to_limit.toFixed(1)}h to limit</>:<ChevronRight size={14}/>}</span></div></button>)}</div></section></div>
- <div className="detail-grid"><section className="panel detail"><div className="panel-heading"><div><div className="eyebrow">FACILITY INVESTIGATION</div><h2>{facility?pretty(facility.id):'Select a facility'}</h2></div><span className={'status-tag '+(alert?'attention':'')}>{alert?'Attention required':'Operating normally'}</span></div><div className="sensor-row"><div><small>TANK LEVEL</small><strong>{facility?.level_pct.toFixed(1)||'—'}<em>%</em></strong><div className="meter"><i style={{width:`${Math.min(100,facility?.level_pct||0)}%`}}/></div><span>Shutdown at {data?.limits.shutdown}%</span></div><div><small>PUMP FLOW</small><strong>{Math.round(facility?.flow_bpd||0).toLocaleString()}<em>bpd</em></strong><span>{facility?.pump_status===2?'Fault detected':facility?.pump_status===1?'Pump running':'Normal cycle · stopped'}</span></div><div><small>TIME TO LIMIT</small><strong>{alert?.hours_to_limit?.toFixed(1)??'—'}<em>{alert?.hours_to_limit!==null&&alert?'hrs':''}</em></strong><span>{alert?.category==='pump_failure'?'Without intervention':'No failure countdown'}</span></div></div><div className="chart-title"><span>{plan?.trace?'Projected tank level · response simulation':'Recorded tank level · last 24 hours'}</span><span><i className="green"/> {plan?.trace?'Recommended':'Recorded'}</span></div><Chart series={plan?.trace?.map(p=>({x:p.hour,y:p.level_pct}))||trend.map(p=>({x:(p.ts-(trend[0]?.ts||0))/3600,y:p.value}))} limit={data?.limits.shutdown||92}/><div className="chart-axis"><span>{plan?.trace?'Now':'24h history'}</span><span>{plan?.trace?`${plan.trace[plan.trace.length-1]?.hour.toFixed(1)}h · repair complete`:'Replay timestamp'}</span></div>{alert&&<div className="evidence"><ShieldCheck size={15}/><div><b>Sensor evidence · {Math.round(alert.confidence*100)}% rule confidence</b>{alert.evidence.map(e=><p key={e}>{e}</p>)}</div></div>}</section>
- <section className="panel recommendation"><div className="panel-heading"><div><div className="eyebrow"><Sparkles size={12}/> RESPONSE INTELLIGENCE</div><h2>{plan?'Recommended response':'Facility summary'}</h2></div>{plan?.verified&&<CheckCheck size={20} className="mint"/>}</div><div className="recommend-body"><h3>{plan?.label||'Continue monitoring'}</h3><p>{plan?.verified?'Evaluated with deterministic simulation and shared fleet allocation.':alert?'Sensor evidence indicates inspection is required. Inspection expenses are not included in cost estimates.':'No incident detected by current monitoring rules.'}</p>{plan&&<><div className="cost"><span>Estimated response cost</span><strong>{alert?.category==='pump_failure'?money(plan.cost):'Not modeled'}</strong></div>{plan.baseline_cost!==undefined&&<div className="saving"><ArrowUpRight size={14}/>{money(Math.max(0,plan.baseline_cost-plan.cost))} avoided vs. no intervention</div>}{plan.alternatives&&<div className="alternatives">{plan.alternatives.slice(0,4).map((a,i)=><div key={i}><span>{a.label}</span><b>{money(a.cost)}</b></div>)}</div>}<button className="button primary" onClick={()=>setReviewed(true)}><ShieldCheck size={15}/>{reviewed?'Simulation marked as reviewed':'Review simulated plan'}<ArrowUpRight size={15}/></button>{reviewed&&<p className="review-note">Reviewed for this replay timestamp. No equipment commands or truck dispatches were sent.</p>}</>}<button className="button ai-button" disabled={thinking||!facility||busy} onClick={investigate}><Sparkles size={15}/>{thinking?'Nemotron is investigating…':'Investigate with Nemotron'}</button>{ai&&<div className="ai-answer" role="status">{ai}</div>}</div></section></div></>}
- {data&&<section className="panel replay"><div><Clock3 size={17}/><span><b>Replay the shift</b><small>{date(at??data.end)}</small></span></div><input aria-label="Replay timestamp" type="range" min={data.start} max={data.end} step="300" value={at??data.end} onChange={e=>setAt(Number(e.target.value))}/><button onClick={()=>setAt(null)}>Latest reading <ChevronRight size={13}/></button></section>}
- <footer><span>NIGHTSHIFT AI <i> / </i> Decision support for the hours that matter.</span><span>Simulation only · © 2026 Avon Corps</span></footer><p className="scope">{data?.planning_scope}</p></section></main></div>
+export default function ControlRoom() {
+  const [datasets, setDatasets] = useState<string[]>([]),
+    [dataset, setDataset] = useState("");
+  const [data, setData] = useState<Dashboard | null>(null),
+    [at, setAt] = useState<number | null>(null);
+  const [navigation, setNavigation] = useState<Navigation>({}),
+    [selection, setSelection] = useState<Selection | null>(null);
+  const [intent, setIntent] = useState<CameraIntent>({
+    target: [0, 0, 0],
+    radius: 100,
+    revision: 0,
+  });
+  const [busy, setBusy] = useState(false),
+    [error, setError] = useState(""),
+    [retry, setRetry] = useState(0);
+  const [railOpen, setRailOpen] = useState(false),
+    [helpOpen, setHelpOpen] = useState(false);
+  const initializedDataset = useRef("");
+  const graph = useMemo(() => (data ? buildScene(data) : null), [data]);
+  const selectedAsset =
+    selection && graph ? graph.assets[selection.assetId] : undefined;
+  useEffect(() => {
+    setRailOpen(window.matchMedia("(min-width: 900px)").matches);
+  }, []);
+  useEffect(() => {
+    if (dataset) return;
+    const controller = new AbortController();
+    setBusy(true);
+    setError("");
+    api
+      .datasets(controller.signal)
+      .then((names) => {
+        if (controller.signal.aborted) return;
+        setDatasets(names);
+        if (!names.length)
+          throw Error(
+            "No datasets found. Add a dataset containing the three EOG input files to the backend.",
+          );
+        setDataset(
+          names.includes(DEFAULT_DATASET) ? DEFAULT_DATASET : names[0],
+        );
+      })
+      .catch((e) => {
+        if (!controller.signal.aborted) setError((e as Error).message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setBusy(false);
+      });
+    return () => controller.abort();
+  }, [dataset, retry]);
+  useEffect(() => {
+    if (!dataset) return;
+    const controller = new AbortController();
+    setBusy(true);
+    setError("");
+    api
+      .dashboard(dataset, at, controller.signal)
+      .then((result) => {
+        if (!controller.signal.aborted) setData(result);
+      })
+      .catch((e) => {
+        if (!controller.signal.aborted) setError((e as Error).message);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setBusy(false);
+      });
+    return () => controller.abort();
+  }, [dataset, at, retry]);
+  useEffect(() => {
+    if (!graph || initializedDataset.current === dataset) return;
+    initializedDataset.current = dataset;
+    setIntent((old) => ({
+      ...navigationFrame(graph, {}),
+      revision: old.revision + 1,
+    }));
+  }, [graph, dataset]);
+  const changeDataset = useCallback((name: string) => {
+    initializedDataset.current = "";
+    setData(null);
+    setSelection(null);
+    setNavigation({});
+    setAt(null);
+    setDataset(name);
+  }, []);
+  const navigate = useCallback(
+    (next: Navigation) => {
+      if (!graph) return;
+      setNavigation(next);
+      setSelection((previous) => {
+        const a = previous && graph.assets[previous.assetId];
+        return a &&
+          (next.facilityId
+            ? a.facilityId === next.facilityId
+            : next.systemId
+              ? a.systemId === next.systemId
+              : false)
+          ? previous
+          : null;
+      });
+      setIntent((old) => ({
+        ...navigationFrame(graph, next),
+        revision: old.revision + 1,
+      }));
+    },
+    [graph],
+  );
+  const select = useCallback(
+    (next: Selection) => {
+      if (!graph || busy) return;
+      const asset = graph.assets[next.assetId];
+      if (!asset) return;
+      setSelection(next);
+      const nav = { systemId: asset.systemId, facilityId: asset.facilityId };
+      if (
+        navigation.systemId !== nav.systemId ||
+        navigation.facilityId !== nav.facilityId
+      ) {
+        setNavigation(nav);
+        setIntent((old) => ({
+          ...navigationFrame(graph, nav),
+          revision: old.revision + 1,
+        }));
+      }
+    },
+    [graph, navigation, busy],
+  );
+  const focus = useCallback(
+    (asset: Asset) => {
+      if (busy) return;
+      setNavigation({ systemId: asset.systemId, facilityId: asset.facilityId });
+      setSelection((previous) =>
+        previous?.assetId === asset.id ? previous : { assetId: asset.id },
+      );
+      setIntent((old) => ({
+        target: asset.position,
+        radius: asset.radius,
+        revision: old.revision + 1,
+      }));
+    },
+    [busy],
+  );
+  const focusIncident = useCallback(
+    (incident: Incident) => {
+      const facility = data?.facilities.find(
+        (f) => f.id === incident.facility_id,
+      );
+      const id =
+        incident.category === "pipeline_leak"
+          ? facility?.pipeline.id
+          : facility?.pump.id;
+      if (id && graph?.assets[id]) focus(graph.assets[id]);
+      if (window.innerWidth < 900) setRailOpen(false);
+    },
+    [data, graph, focus],
+  );
+  const reset = useCallback(() => {
+    if (graph)
+      setIntent((old) => ({
+        ...navigationFrame(graph, navigation),
+        revision: old.revision + 1,
+      }));
+  }, [graph, navigation]);
+  const replay = useCallback((time: number | null) => setAt(time), []);
+  const interactions = useMemo(
+    () => ({ onSelect: select, onFocus: focus, onNavigate: navigate }),
+    [select, focus, navigate],
+  );
+  const scopeFacilities =
+    data?.facilities.filter(
+      (f) => !navigation.systemId || f.system_id === navigation.systemId,
+    ) || [];
+  const assetOptions = graph
+    ? Object.values(graph.assets).filter((a) =>
+        navigation.facilityId
+          ? a.facilityId === navigation.facilityId
+          : navigation.systemId
+            ? a.systemId === navigation.systemId
+            : true,
+      )
+    : [];
+  return (
+    <main className={"control-room " + (selectedAsset ? "inspector-open" : "")}>
+      <div className="scene-stage">
+        {data && graph ? (
+          <DigitalTwinScene
+            graph={graph}
+            data={data}
+            navigation={navigation}
+            selection={selection}
+            intent={intent}
+            interactions={interactions}
+          />
+        ) : (
+          <div className="scene-placeholder">
+            <div className="placeholder-grid" />
+            {!error && (
+              <div className="scene-loading">
+                <LoaderCircle size={24} className="spin" />
+                <span>LOADING OILFIELD TOPOLOGY</span>
+                <p>Reading the recorded network and telemetry.</p>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+      <TopBar
+        datasets={datasets}
+        dataset={dataset}
+        data={data}
+        navigation={navigation}
+        busy={busy}
+        onDataset={changeDataset}
+        onNavigate={navigate}
+        onReset={reset}
+        onBack={() =>
+          navigate(
+            navigation.facilityId ? { systemId: navigation.systemId } : {},
+          )
+        }
+      />
+      {error && (
+        <div
+          className={"connection-error glass " + (!data ? "centered" : "")}
+          role="alert"
+        >
+          <AlertTriangle size={21} />
+          <div>
+            <h2>
+              {data
+                ? "Replay update failed"
+                : "Unable to load recorded operations"}
+            </h2>
+            <p>{error}</p>
+            <small>
+              {data
+                ? "Showing the last successfully loaded timestamp."
+                : "The frontend uses the existing Python API at 127.0.0.1:8000. Start it to load your network."}
+            </small>
+            <button
+              className="ui-button"
+              onClick={() => setRetry((n) => n + 1)}
+            >
+              <RotateCcw size={13} />
+              Retry connection
+            </button>
+          </div>
+        </div>
+      )}
+      {data && (
+        <>
+          <div className="scene-title">
+            <span className="technical-label">
+              <span className="status-dot cyan" />
+              OILFIELD WATER OPERATIONS
+            </span>
+            <h2>
+              {navigation.facilityId
+                ? humanize(navigation.facilityId).toLowerCase()
+                : navigation.systemId
+                  ? `System ${navigation.systemId}`
+                  : "The whole field. One clear view."}
+            </h2>
+            <p>
+              {navigation.facilityId
+                ? "Wells → tank → pump → pipeline → disposal"
+                : `${navigation.systemId ? scopeFacilities.length : data.facilities.length} facilities · ${navigation.systemId ? "shared disposal destination" : `${data.systems.length} connected systems`}`}
+            </p>
+          </div>
+          <div className="scene-navigator glass">
+            <Layers3 size={14} />
+            <select
+              aria-label="Navigate to system"
+              value={navigation.systemId || ""}
+              onChange={(e) =>
+                navigate(e.target.value ? { systemId: e.target.value } : {})
+              }
+            >
+              <option value="">All systems</option>
+              {data.systems.map((s) => (
+                <option key={s.id} value={s.id}>
+                  System {s.id}
+                </option>
+              ))}
+            </select>
+            {navigation.systemId && (
+              <select
+                aria-label="Navigate to facility"
+                value={navigation.facilityId || ""}
+                onChange={(e) =>
+                  navigate({
+                    systemId: navigation.systemId,
+                    facilityId: e.target.value || undefined,
+                  })
+                }
+              >
+                <option value="">All facilities</option>
+                {scopeFacilities.map((f) => (
+                  <option key={f.id} value={f.id}>
+                    {f.id.replace(
+                      `${navigation.systemId}_FACILITY_`,
+                      "Facility ",
+                    )}
+                  </option>
+                ))}
+              </select>
+            )}
+            <label className="asset-picker">
+              <MousePointer2 size={13} />
+              <select
+                aria-label="Inspect equipment"
+                value={selection?.assetId || ""}
+                onChange={(e) => {
+                  if (e.target.value) select({ assetId: e.target.value });
+                }}
+              >
+                <option value="">Inspect equipment…</option>
+                {assetOptions.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.id}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <IncidentRail
+            incidents={data.alerts}
+            open={railOpen}
+            onToggle={() => setRailOpen((v) => !v)}
+            onSelect={focusIncident}
+            selectedFacility={selectedAsset?.facilityId}
+            disabled={busy}
+          />
+          {selectedAsset && selection && (
+            <AssetInspector
+              key={`${dataset}:${selectedAsset.id}`}
+              asset={selectedAsset}
+              selection={selection}
+              data={data}
+              dataset={dataset}
+              disabled={busy}
+              onClose={() => setSelection(null)}
+              onFocus={() => focus(selectedAsset)}
+              onSelect={select}
+            />
+          )}
+          <div className="scene-legend glass">
+            <span>
+              <i className="status-dot healthy" />
+              Healthy
+            </span>
+            <span>
+              <i className="status-dot idle" />
+              Normal stop
+            </span>
+            <span>
+              <i className="status-dot warning" />
+              Warning
+            </span>
+            <span>
+              <i className="status-dot fault" />
+              Fault
+            </span>
+            <span>
+              <i className="selection-swatch" />
+              Selected
+            </span>
+          </div>
+          <div className="scene-tools">
+            {selectedAsset && (
+              <button
+                className="tool-button glass"
+                onClick={() => focus(selectedAsset)}
+                title="Focus selected equipment"
+              >
+                <Crosshair size={16} />
+                <span>Focus</span>
+              </button>
+            )}
+            <button
+              className="tool-button glass"
+              onClick={reset}
+              title="Reset current camera view"
+            >
+              <Box size={16} />
+              <span>Reset view</span>
+            </button>
+            <button
+              className={"tool-button glass " + (helpOpen ? "active" : "")}
+              aria-expanded={helpOpen}
+              onClick={() => setHelpOpen((v) => !v)}
+              title="Navigation guide"
+            >
+              <HelpCircle size={16} />
+              <span>Controls</span>
+            </button>
+          </div>
+          {helpOpen && (
+            <div className="navigation-help glass">
+              <div>
+                <h2>Navigate the twin</h2>
+                <button
+                  className="icon-button"
+                  onClick={() => setHelpOpen(false)}
+                  aria-label="Close navigation guide"
+                >
+                  <X size={15} />
+                </button>
+              </div>
+              <dl>
+                <dt>Rotate</dt>
+                <dd>Left-drag / one finger</dd>
+                <dt>Zoom</dt>
+                <dd>Scroll / pinch</dd>
+                <dt>Pan</dt>
+                <dd>Right-drag / two fingers</dd>
+                <dt>Inspect</dt>
+                <dd>Click equipment or a sensor</dd>
+                <dt>Focus</dt>
+                <dd>Double-click / Focus button</dd>
+              </dl>
+              <p>
+                Use breadcrumbs to move back through the network. Equipment is
+                laid out schematically.
+              </p>
+            </div>
+          )}
+          <ReplayTimeline
+            key={dataset}
+            data={data}
+            onChange={replay}
+            busy={busy}
+          />
+          {busy && (
+            <div className="updating-pill" role="status">
+              <LoaderCircle size={12} className="spin" />
+              Updating recorded state
+            </div>
+          )}
+        </>
+      )}
+      <footer className="scene-footer">
+        <span>
+          <ArrowUpRight size={10} />
+          SCHEMATIC LAYOUT · NOT GEOGRAPHIC SCALE
+        </span>
+        <span>
+          Decision support & simulation only <i>·</i> © 2026 Avon Corps
+        </span>
+      </footer>
+    </main>
+  );
 }
-function Stat({label,value,note,icon,urgent=false}:{label:string;value:string;note:string;icon:React.ReactNode;urgent?:boolean}){return <section className={'stat '+(urgent?'urgent':'')}><div><span>{label}</span>{icon}</div><strong>{value}</strong><p>{urgent&&<i/>}{note}</p></section>}
-function Chart({series,limit}:{series:{x:number;y:number}[];limit:number}){const max=Math.max(1,...series.map(p=>p.x));const points=series.map(p=>`${20+p.x/max*560},${145-Math.max(0,Math.min(100,p.y))/100*130}`).join(' ');const ly=145-limit/100*130;return <svg className="chart" viewBox="0 0 600 165" role="img" aria-label="Tank fill percentage over time"><defs><linearGradient id="fill" x1="0" x2="0" y1="0" y2="1"><stop stopColor="#7addb6" stopOpacity=".2"/><stop offset="1" stopColor="#7addb6" stopOpacity="0"/></linearGradient></defs>{[25,50,75].map(n=><g key={n}><line x1="20" x2="580" y1={145-n*1.3} y2={145-n*1.3} stroke="#253330"/><text x="0" y={148-n*1.3} fill="#74837e" fontSize="8">{n}</text></g>)}<line x1="20" x2="580" y1={ly} y2={ly} stroke="#bd7956" strokeDasharray="5 5"/><text x="440" y={ly-5} fill="#bd7956" fontSize="8">SHUTDOWN LIMIT · {limit}%</text>{series.length>0&&<><polygon points={`20,145 ${points} 580,145`} fill="url(#fill)"/><polyline points={points} fill="none" stroke="#83d8b7" strokeWidth="2"/></>}</svg>}
